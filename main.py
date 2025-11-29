@@ -522,11 +522,12 @@ class GeminiWorker(QThread):
     progress = pyqtSignal(int)
     
     def __init__(self, api_key: str, image_paths: List[str], document_content: Optional[str],
-                 test_type: str, app_context: str, input_mode: str):
+                 video_path: Optional[str], test_type: str, app_context: str, input_mode: str):
         super().__init__()
         self.api_key = api_key
         self.image_paths = image_paths  # Now a list of paths
         self.document_content = document_content
+        self.video_path = video_path
         self.test_type = test_type
         self.app_context = app_context
         self.input_mode = input_mode
@@ -539,7 +540,7 @@ class GeminiWorker(QThread):
             self.progress.emit(20)
             
             # Use gemini-1.5-flash for all cases
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            model = genai.GenerativeModel('gemini-2.0-flash')
             
             self.progress.emit(40)
             
@@ -556,6 +557,21 @@ class GeminiWorker(QThread):
                 for img_path in self.image_paths:
                     img = Image.open(img_path)
                     content.append(img)
+            
+            # Add video if in video mode
+            if self.video_path and self.input_mode == "video":
+                # Upload video file to Gemini
+                video_file = genai.upload_file(path=self.video_path)
+                # Wait for processing
+                import time
+                while video_file.state.name == "PROCESSING":
+                    time.sleep(2)
+                    video_file = genai.get_file(video_file.name)
+                
+                if video_file.state.name == "FAILED":
+                    raise Exception("Video processing failed")
+                
+                content.append(video_file)
             
             content.append(prompt)
             
@@ -620,6 +636,25 @@ Analyze the provided document containing specifications/requirements:
 
 **Document Content:**
 """ + self.document_content + """
+
+"""
+        elif self.input_mode == "video" and self.video_path:
+            base_prompt += """**Input Mode:** VIDEO ANALYSIS (Premium Feature)
+
+Analyze the provided video recording of the Android app to identify:
+1. User interactions and gestures (taps, swipes, scrolls, long presses)
+2. Screen transitions and navigation flow
+3. UI elements that appear during the recording
+4. Loading states and animations
+5. Error states or unexpected behaviors
+6. Timing between actions and responses
+7. Complete user journey/workflow captured in the video
+
+Focus on creating test cases that:
+- Verify the exact flow shown in the video
+- Test timing and responsiveness
+- Cover the user interactions demonstrated
+- Include edge cases based on the observed behavior
 
 """
         
@@ -786,11 +821,11 @@ class DropZone(QFrame):
                 self.fileDropped.emit(f)
         else:
             file_filter = "Documents (*.pdf *.docx *.txt *.md)"
-            file_path, _ = QFileDialog.getOpenFileName(
+        file_path, _ = QFileDialog.getOpenFileName(
                 self, "Select Document", "", file_filter
-            )
-            if file_path:
-                self.fileDropped.emit(file_path)
+        )
+        if file_path:
+            self.fileDropped.emit(file_path)
     
     def set_file(self, path: str):
         """Update UI to show selected file."""
@@ -885,7 +920,7 @@ class MultiImagePreview(QFrame):
         self.setStyleSheet("""
             QFrame {
                 background: rgba(18, 18, 26, 0.6);
-                border: 1px solid #2d2d44;
+            border: 1px solid #2d2d44;
                 border-radius: 6px;
             }
         """)
@@ -1034,10 +1069,12 @@ class AndroidTestCaseGenerator(QMainWindow):
     def __init__(self):
         super().__init__()
         self.image_paths: List[str] = []  # Changed to list
+        self.video_path: Optional[str] = None
         self.document_path: Optional[str] = None
         self.document_content: Optional[str] = None
         self.worker: Optional[GeminiWorker] = None
-        self.input_mode = "image"  # "image", "document", "combined"
+        self.input_mode = "image"  # "image", "document", "combined", "video"
+        self.is_premium = False  # IAP status
         
         self.setup_ui()
         self.setWindowTitle("Android Test Case Generator")
@@ -1175,10 +1212,12 @@ class AndroidTestCaseGenerator(QMainWindow):
         self.image_mode_btn = ModeButton("Image Only", "📷", "Screenshot analysis")
         self.doc_mode_btn = ModeButton("Document Only", "📄", "From specifications")
         self.combined_mode_btn = ModeButton("Combined", "🔗", "Image + Document")
+        self.video_mode_btn = ModeButton("Video", "🎬", "PRO ⭐")
         
         self.mode_group.addButton(self.image_mode_btn, 0)
         self.mode_group.addButton(self.doc_mode_btn, 1)
         self.mode_group.addButton(self.combined_mode_btn, 2)
+        self.mode_group.addButton(self.video_mode_btn, 3)
         
         self.image_mode_btn.setChecked(True)
         
@@ -1187,6 +1226,7 @@ class AndroidTestCaseGenerator(QMainWindow):
         buttons_layout.addWidget(self.image_mode_btn)
         buttons_layout.addWidget(self.doc_mode_btn)
         buttons_layout.addWidget(self.combined_mode_btn)
+        buttons_layout.addWidget(self.video_mode_btn)
         
         mode_layout.addLayout(buttons_layout)
         layout.addWidget(mode_frame)
@@ -1205,8 +1245,12 @@ class AndroidTestCaseGenerator(QMainWindow):
         self.doc_status = QLabel("📄 No document")
         self.doc_status.setObjectName("statusInactive")
         
+        self.video_status = QLabel("🎬 No video")
+        self.video_status.setObjectName("statusInactive")
+        
         status_layout.addWidget(self.image_status)
         status_layout.addWidget(self.doc_status)
+        status_layout.addWidget(self.video_status)
         status_layout.addStretch()
         
         layout.addWidget(status_frame)
@@ -1227,6 +1271,10 @@ class AndroidTestCaseGenerator(QMainWindow):
         # Page 2: Combined input
         combined_page = self._create_combined_input_page()
         self.input_stack.addWidget(combined_page)
+        
+        # Page 3: Video input (Premium)
+        video_page = self._create_video_input_page()
+        self.input_stack.addWidget(video_page)
         
         layout.addWidget(self.input_stack)
         
@@ -1429,6 +1477,243 @@ class AndroidTestCaseGenerator(QMainWindow):
         
         return page
     
+    def _create_video_input_page(self) -> QWidget:
+        """Create the video input page (Premium feature)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Premium badge
+        premium_label = QLabel("⭐ PREMIUM FEATURE")
+        premium_label.setStyleSheet("""
+            font-size: 14px;
+            font-weight: 700;
+            color: #ffd700;
+            background: rgba(255, 215, 0, 0.1);
+            border: 1px solid #ffd700;
+            border-radius: 6px;
+            padding: 8px 16px;
+        """)
+        premium_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(premium_label)
+        
+        # Video drop zone
+        self.video_drop = QFrame()
+        self.video_drop.setStyleSheet("""
+            QFrame {
+                background: rgba(26, 26, 46, 0.6);
+                border: 2px dashed #ffd700;
+                border-radius: 10px;
+                min-height: 100px;
+            }
+            QFrame:hover {
+                background: rgba(255, 215, 0, 0.05);
+            }
+        """)
+        self.video_drop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.video_drop.mousePressEvent = self._on_video_drop_clicked
+        
+        video_layout = QVBoxLayout(self.video_drop)
+        video_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        video_layout.setSpacing(6)
+        
+        video_icon = QLabel("🎬")
+        video_icon.setStyleSheet("font-size: 32px;")
+        video_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.video_main_label = QLabel("Drop Video Here")
+        self.video_main_label.setStyleSheet("font-size: 14px; font-weight: 600; color: #ffd700;")
+        self.video_main_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        video_sub_label = QLabel("Click to browse • MP4, AVI, MOV, MKV")
+        video_sub_label.setStyleSheet("font-size: 10px; color: #b0b0c0;")
+        video_sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.video_file_label = QLabel("")
+        self.video_file_label.setStyleSheet("font-size: 11px; color: #00ffd5; font-weight: 600;")
+        self.video_file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_file_label.hide()
+        
+        video_layout.addWidget(video_icon)
+        video_layout.addWidget(self.video_main_label)
+        video_layout.addWidget(video_sub_label)
+        video_layout.addWidget(self.video_file_label)
+        
+        layout.addWidget(self.video_drop)
+        
+        # Video info
+        info_frame = QFrame()
+        info_frame.setStyleSheet("""
+            QFrame {
+                background: rgba(18, 18, 26, 0.6);
+                border: 1px solid #2d2d44;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_frame)
+        info_layout.setSpacing(4)
+        
+        info_title = QLabel("🎥 Video Analysis Features:")
+        info_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #ffd700;")
+        
+        features = [
+            "• Analyze app screen recordings",
+            "• Detect UI interactions and gestures",
+            "• Generate flow-based test cases",
+            "• Capture timing and transitions"
+        ]
+        
+        info_layout.addWidget(info_title)
+        for feature in features:
+            feat_label = QLabel(feature)
+            feat_label.setStyleSheet("font-size: 11px; color: #b0b0c0;")
+            info_layout.addWidget(feat_label)
+        
+        layout.addWidget(info_frame)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        
+        self.unlock_btn = QPushButton("🔓 Unlock Premium - $9.99")
+        self.unlock_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ffd700, stop:1 #ffaa00);
+                border: none;
+                border-radius: 8px;
+                padding: 12px 24px;
+                font-size: 13px;
+                font-weight: 700;
+                color: #000000;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ffdd33, stop:1 #ffbb33);
+            }
+        """)
+        self.unlock_btn.clicked.connect(self._show_iap_dialog)
+        btn_layout.addWidget(self.unlock_btn)
+        
+        clear_video_btn = QPushButton("Clear Video")
+        clear_video_btn.setObjectName("clearBtn")
+        clear_video_btn.clicked.connect(self._clear_video)
+        btn_layout.addWidget(clear_video_btn)
+        
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        return page
+    
+    def _show_iap_dialog(self):
+        """Show the IAP purchase dialog."""
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("🌟 Unlock Premium")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setText(
+            "<h2 style='color: #ffd700;'>⭐ Premium Features</h2>"
+            "<p>Unlock powerful video analysis capabilities:</p>"
+            "<ul>"
+            "<li>📹 Upload and analyze app screen recordings</li>"
+            "<li>🎯 AI-powered gesture and interaction detection</li>"
+            "<li>📊 Flow-based test case generation</li>"
+            "<li>⏱️ Timing and transition analysis</li>"
+            "<li>🚀 Priority support</li>"
+            "</ul>"
+            "<p style='font-size: 18px; font-weight: bold; color: #00ffd5;'>Price: $9.99 (One-time)</p>"
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        dialog.button(QMessageBox.StandardButton.Yes).setText("💳 Purchase Now")
+        dialog.button(QMessageBox.StandardButton.No).setText("Maybe Later")
+        
+        dialog.setStyleSheet("""
+            QMessageBox {
+                background: #12121a;
+            }
+            QMessageBox QLabel {
+                color: #e0e0e0;
+                font-size: 13px;
+            }
+            QPushButton {
+                background: #1a1a2e;
+                border: 1px solid #00ffd5;
+                border-radius: 6px;
+                padding: 8px 20px;
+                color: #00ffd5;
+                font-weight: 600;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background: #00ffd5;
+                color: #0a0a0f;
+            }
+        """)
+        
+        result = dialog.exec()
+        
+        if result == QMessageBox.StandardButton.Yes:
+            # Simulate successful purchase
+            self.is_premium = True
+            self.unlock_btn.setText("✓ Premium Unlocked")
+            self.unlock_btn.setEnabled(False)
+            self.unlock_btn.setStyleSheet("""
+                QPushButton {
+                    background: #2d4a3e;
+                    border: 1px solid #00ffd5;
+                    border-radius: 8px;
+                    padding: 12px 24px;
+                    font-size: 13px;
+                    font-weight: 700;
+                    color: #00ffd5;
+                }
+            """)
+            QMessageBox.information(
+                self, 
+                "🎉 Thank You!", 
+                "Premium features unlocked!\n\nYou can now upload and analyze videos."
+            )
+            self.status_label.setText("Premium • Video analysis unlocked")
+    
+    def _on_video_drop_clicked(self, event):
+        """Handle video drop zone click."""
+        if not self.is_premium:
+            self._show_iap_dialog()
+            return
+        
+        file_filter = "Videos (*.mp4 *.avi *.mov *.mkv *.webm)"
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video", "", file_filter
+        )
+        if file_path:
+            self._set_video(file_path)
+    
+    def _set_video(self, path: str):
+        """Set the video file."""
+        valid_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+        ext = Path(path).suffix.lower()
+        
+        if ext not in valid_extensions:
+            QMessageBox.warning(self, "Invalid File", "Please select a valid video file.")
+            return
+        
+        self.video_path = path
+        filename = Path(path).name
+        self.video_main_label.setText("Video Selected")
+        self.video_file_label.setText(f"✓ {filename}")
+        self.video_file_label.show()
+        self._update_mode_ui()
+    
+    def _clear_video(self):
+        """Clear the selected video."""
+        self.video_path = None
+        self.video_main_label.setText("Drop Video Here")
+        self.video_file_label.hide()
+        self._update_mode_ui()
+    
     def _create_output_panel(self) -> QWidget:
         """Create the output panel."""
         panel = QFrame()
@@ -1526,6 +1811,9 @@ class AndroidTestCaseGenerator(QMainWindow):
         elif button == self.combined_mode_btn:
             self.input_mode = "combined"
             self.input_stack.setCurrentIndex(2)
+        elif button == self.video_mode_btn:
+            self.input_mode = "video"
+            self.input_stack.setCurrentIndex(3)
         
         self._update_mode_ui()
     
@@ -1548,15 +1836,25 @@ class AndroidTestCaseGenerator(QMainWindow):
             self.doc_status.setText("📄 No document")
             self.doc_status.setObjectName("statusInactive")
         
+        if self.video_path:
+            filename = Path(self.video_path).name
+            self.video_status.setText(f"🎬 {filename[:15]}..." if len(filename) > 15 else f"🎬 {filename}")
+            self.video_status.setObjectName("statusActive")
+        else:
+            self.video_status.setText("🎬 No video")
+            self.video_status.setObjectName("statusInactive")
+        
         # Force style refresh
         self.image_status.setStyle(self.image_status.style())
         self.doc_status.setStyle(self.doc_status.style())
+        self.video_status.setStyle(self.video_status.style())
         
         # Update status bar
         mode_text = {
             "image": "Image Only mode",
             "document": "Document Only mode",
-            "combined": "Combined mode (Image + Document)"
+            "combined": "Combined mode (Image + Document)",
+            "video": "Video mode (Premium)"
         }
         self.status_label.setText(f"Ready • {mode_text[self.input_mode]}")
     
@@ -1699,6 +1997,14 @@ class AndroidTestCaseGenerator(QMainWindow):
                 QMessageBox.warning(self, "Input Required", "Please upload at least an image or document for Combined mode.")
                 return
         
+        if self.input_mode == "video":
+            if not self.is_premium:
+                self._show_iap_dialog()
+                return
+            if not self.video_path:
+                QMessageBox.warning(self, "Video Required", "Please upload a video for Video mode.")
+                return
+        
         # Disable button and show progress
         self.generate_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -1712,6 +2018,7 @@ class AndroidTestCaseGenerator(QMainWindow):
             api_key=api_key,
             image_paths=self.image_paths if self.input_mode in ("image", "combined") else [],
             document_content=self.document_content if self.input_mode in ("document", "combined") else None,
+            video_path=self.video_path if self.input_mode == "video" else None,
             test_type=self.test_type_combo.currentText(),
             app_context=self.context_input.text(),
             input_mode=self.input_mode
